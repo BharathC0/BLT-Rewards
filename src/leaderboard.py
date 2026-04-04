@@ -49,12 +49,15 @@ def parse_github_timestamp(ts_str: str) -> int:
         return 0
 
 
+from html import escape as html_escape
+
 def avatar_img_tag(login: str, size: int = 20) -> str:
     """Return a fixed-size GitHub avatar image tag safe for markdown tables."""
     safe_login = quote(str(login), safe="")
+    safe_alt = html_escape(str(login))
     return (
         f"<img src=\"https://avatars.githubusercontent.com/{safe_login}?size={size}&v=4\" "
-        f"width=\"{size}\" height=\"{size}\" alt=\"{login}\" />"
+        f"width=\"{size}\" height=\"{size}\" alt=\"{safe_alt}\" />"
     )
 
 
