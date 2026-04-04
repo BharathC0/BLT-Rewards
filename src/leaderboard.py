@@ -129,8 +129,19 @@ async def d1_first(db, sql: str, params: tuple = ()):
     return rows[0] if rows else None
 
 
+_VALID_TABLES = frozenset({
+    "leaderboard_monthly_stats",
+    "leaderboard_open_prs", 
+    "leaderboard_pr_state",
+    "leaderboard_review_credits",
+    "leaderboard_backfill_state",
+    "leaderboard_backfill_repo_done",
+})
+
 async def d1_has_column(db, table_name: str, column_name: str) -> bool:
     """Return True when the table already contains the given column."""
+    if table_name not in _VALID_TABLES:
+        return False
     try:
         rows = await d1_all(db, f"PRAGMA table_info({table_name})")
     except Exception:
