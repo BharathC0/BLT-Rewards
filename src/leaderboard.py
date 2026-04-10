@@ -723,10 +723,10 @@ async def reset_leaderboard_month(org: str, mk: str, db) -> dict:
 
     # Build all statements for atomic batch execution
     stmts_by_key: list[tuple[str, str, tuple]] = [
-        ("leaderboard_monthly_stats",    f"DELETE FROM leaderboard_monthly_stats WHERE org = ? AND month_key = ?",    (org, mk)),
-        ("leaderboard_backfill_repo_done", f"DELETE FROM leaderboard_backfill_repo_done WHERE org = ? AND month_key = ?", (org, mk)),
-        ("leaderboard_review_credits",   f"DELETE FROM leaderboard_review_credits WHERE org = ? AND month_key = ?",   (org, mk)),
-        ("leaderboard_backfill_state",   f"DELETE FROM leaderboard_backfill_state WHERE org = ? AND month_key = ?",   (org, mk)),
+        ("leaderboard_monthly_stats",    "DELETE FROM leaderboard_monthly_stats WHERE org = ? AND month_key = ?",    (org, mk)),
+        ("leaderboard_backfill_repo_done", "DELETE FROM leaderboard_backfill_repo_done WHERE org = ? AND month_key = ?", (org, mk)),
+        ("leaderboard_review_credits",   "DELETE FROM leaderboard_review_credits WHERE org = ? AND month_key = ?",   (org, mk)),
+        ("leaderboard_backfill_state",   "DELETE FROM leaderboard_backfill_state WHERE org = ? AND month_key = ?",   (org, mk)),
         ("leaderboard_pr_state",
          """
          DELETE FROM leaderboard_pr_state
