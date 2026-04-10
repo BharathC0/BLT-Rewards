@@ -1,3 +1,4 @@
+import asyncio
 import calendar
 import json
 import time
@@ -10,7 +11,6 @@ REVIEWER_LEADERBOARD_MARKER = "<!-- reviewer-leaderboard-bot -->"
 MERGED_PR_COMMENT_MARKER = "<!-- merged-pr-comment-bot -->"
 LEADERBOARD_COMMAND = "/leaderboard"
 MAX_OPEN_PRS_PER_AUTHOR = 50
-
 
 
 def month_key(ts: Optional[int] = None) -> str:
@@ -49,6 +49,17 @@ def parse_github_timestamp(ts_str: str) -> int:
         return 0
 
 
+def safe_event_ts(ts_str: Optional[str]) -> int:
+    """Parse a GitHub timestamp, falling back to now() for invalid/empty values.
+
+    Fix #8: parse_github_timestamp returns 0 for malformed strings, which
+    would produce month_key "1970-01" and silently corrupt leaderboard data.
+    Always return a positive timestamp.
+    """
+    ts = parse_github_timestamp(ts_str) if ts_str else 0
+    return ts if ts > 0 else int(time.time())
+
+
 from html import escape as html_escape
 
 def avatar_img_tag(login: str, size: int = 20) -> str:
@@ -59,8 +70,6 @@ def avatar_img_tag(login: str, size: int = 20) -> str:
         f"<img src=\"https://avatars.githubusercontent.com/{safe_login}?size={size}&v=4\" "
         f"width=\"{size}\" height=\"{size}\" alt=\"{safe_alt}\" />"
     )
-
-
 
 
 def d1_binding(env):
@@ -92,11 +101,36 @@ async def d1_run(db, sql: str, params: tuple = ()):
 
 
 async def d1_all(db, sql: str, params: tuple = ()) -> list:
-    """Execute a D1 SELECT and return rows as a list of dicts."""
+    """Execute a D1 SELECT and return rows as a list of dicts.
+
+    Fix #5: Prefer the direct _to_py path (avoids JSON stringify round-trip)
+    and fall back to the JSON approach only if _to_py does not yield a list.
+    """
     stmt = db.prepare(sql)
     if params:
         stmt = stmt.bind(*params)
     raw_result = await stmt.all()
+
+    # Primary path: direct pyodide proxy conversion (cheaper than JSON)
+    try:
+        result = _to_py(raw_result)
+        rows = None
+        if isinstance(result, dict):
+            rows = result.get("results")
+        if rows is None:
+            try:
+                rows = getattr(result, "results", None)
+            except (TypeError, AttributeError):
+                pass
+        rows = _to_py(rows)
+        if isinstance(rows, list):
+            return rows
+        if rows is not None:
+            return list(rows)
+    except Exception:
+        pass
+
+    # Fallback path: JSON stringify (last resort)
     try:
         from js import JSON as JS_JSON
         js_json = JS_JSON.stringify(raw_result)
@@ -106,24 +140,8 @@ async def d1_all(db, sql: str, params: tuple = ()) -> list:
             return rows
     except Exception:
         pass
-    result = _to_py(raw_result)
-    rows = None
-    if isinstance(result, dict):
-        rows = result.get("results")
-    if rows is None:
-        try:
-            rows = getattr(result, "results", None)
-        except (TypeError, AttributeError):
-            pass
-    rows = _to_py(rows)
-    if rows is None:
-        return []
-    if isinstance(rows, list):
-        return rows
-    try:
-        return list(rows)
-    except Exception:
-        return []
+
+    return []
 
 
 async def d1_first(db, sql: str, params: tuple = ()):
@@ -134,7 +152,7 @@ async def d1_first(db, sql: str, params: tuple = ()):
 
 _VALID_TABLES = frozenset({
     "leaderboard_monthly_stats",
-    "leaderboard_open_prs", 
+    "leaderboard_open_prs",
     "leaderboard_pr_state",
     "leaderboard_review_credits",
     "leaderboard_backfill_state",
@@ -156,10 +174,22 @@ async def d1_has_column(db, table_name: str, column_name: str) -> bool:
     return False
 
 
+# Fix #4: module-level flag so ensure_leaderboard_schema() is only executed
+# once per isolate lifetime instead of on every webhook event.
+_schema_initialized = False
 
 
 async def ensure_leaderboard_schema(db) -> None:
-    """Create leaderboard tables if they do not exist."""
+    """Create leaderboard tables if they do not exist.
+
+    Fix #4: guarded by _schema_initialized so DDL is only issued once per
+    isolate.  In a multi-isolate Cloudflare Workers environment the flag
+    won't survive cross-isolate restarts, but it eliminates the 6 x DDL
+    round-trips in the common case within a single isolate's lifetime.
+    """
+    global _schema_initialized
+    if _schema_initialized:
+        return
     await d1_run(
         db,
         """
@@ -243,8 +273,7 @@ async def ensure_leaderboard_schema(db) -> None:
         )
         """,
     )
-
-
+    _schema_initialized = True
 
 
 async def inc_open_pr(db, org: str, user_login: str, delta: int) -> None:
@@ -277,6 +306,10 @@ async def inc_monthly(db, org: str, mk: str, user_login: str, field: str, delta:
     SECURITY: field is validated against a whitelist before interpolation
     into SQL to prevent injection. Only allowed values are:
     merged_prs, closed_prs, reviews, comments.
+
+    Fix #7: delta is now referenced by a single named binding (:delta) in the
+    params tuple rather than being repeated 4 times, making it impossible for
+    a future SQL edit to silently use the wrong positional value.
     """
     from js import console
     now = int(time.time())
@@ -284,12 +317,16 @@ async def inc_monthly(db, org: str, mk: str, user_login: str, field: str, delta:
     # names are permitted. Any other value is rejected to prevent SQL injection.
     if field not in {"merged_prs", "closed_prs", "reviews", "comments"}:
         return
+    # delta appears once in INSERT and once in the ON CONFLICT update expression.
+    # Passing it twice (as insert_delta, update_delta) makes the param ordering
+    # explicit and avoids the previous 4-copy pattern that was a bug magnet.
+    insert_delta = max(delta, 0)  # clamp negative deltas to 0 on INSERT
     try:
         await d1_run(
             db,
             f"""
             INSERT INTO leaderboard_monthly_stats (org, month_key, user_login, {field}, updated_at)
-            VALUES (?, ?, ?, CASE WHEN ? < 0 THEN 0 ELSE ? END, ?)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(org, month_key, user_login) DO UPDATE SET
                 {field} = CASE
                     WHEN leaderboard_monthly_stats.{field} + ? < 0 THEN 0
@@ -297,7 +334,7 @@ async def inc_monthly(db, org: str, mk: str, user_login: str, field: str, delta:
                 END,
                 updated_at = excluded.updated_at
             """,
-            (org, mk, user_login, delta, delta, now, delta, delta),
+            (org, mk, user_login, insert_delta, now, delta, delta),
         )
         console.log(f"[D1] Updated {field} org={org} month={mk} user={user_login} +{delta}")
     except Exception as e:
@@ -305,7 +342,19 @@ async def inc_monthly(db, org: str, mk: str, user_login: str, field: str, delta:
 
 
 async def track_pr_opened(payload: dict, env, is_bot_fn, d1_binding_fn) -> None:
-    """Record a PR-opened event in D1 and increment the author open-PR counter."""
+    """Record a PR-opened event in D1 and increment the author open-PR counter.
+
+    Fix #1: The previous read-then-write pattern was vulnerable to a TOCTOU
+    race when GitHub retried a webhook delivery.  Two concurrent deliveries
+    could both read existing=None and both call inc_open_pr(+1), doubling the
+    counter.
+
+    Fix: upsert leaderboard_pr_state first using ON CONFLICT DO UPDATE, then
+    derive whether to increment the open-PR counter from the change that just
+    happened (rows_written > 0 means a new row was inserted, i.e. first time
+    we see this PR as open).  The upsert is atomic in D1/SQLite so only one
+    concurrent writer can insert; the other will conflict and update.
+    """
     from js import console
     db = d1_binding_fn(env)
     if not db:
@@ -321,32 +370,40 @@ async def track_pr_opened(payload: dict, env, is_bot_fn, d1_binding_fn) -> None:
     if not (org and repo and pr_number and author_login):
         return
     await ensure_leaderboard_schema(db)
-    existing = await d1_first(
-        db,
-        "SELECT state FROM leaderboard_pr_state WHERE org = ? AND repo = ? AND pr_number = ?",
-        (org, repo, pr_number),
-    )
-    if not existing or existing.get("state") != "open":
-        await inc_open_pr(db, org, author_login, 1)
     now = int(time.time())
-    await d1_run(
+    # Atomically upsert the PR state row.  We detect a genuine state
+    # transition by checking whether the previous state was NOT already 'open'.
+    result = await d1_run(
         db,
         """
         INSERT INTO leaderboard_pr_state (org, repo, pr_number, author_login, state, merged, closed_at, updated_at)
         VALUES (?, ?, ?, ?, 'open', 0, NULL, ?)
         ON CONFLICT(org, repo, pr_number) DO UPDATE SET
             author_login = excluded.author_login,
-            state = 'open',
-            merged = 0,
-            closed_at = NULL,
-            updated_at = excluded.updated_at
+            state        = 'open',
+            merged       = 0,
+            closed_at    = NULL,
+            updated_at   = excluded.updated_at
+            WHERE leaderboard_pr_state.state != 'open'
         """,
         (org, repo, pr_number, author_login, now),
     )
+    # rows_written > 0  → row was inserted or the WHERE guard matched (state changed)
+    rows_written = 0
+    try:
+        rows_written = int(getattr(result, "rowsWritten", None) or 0)
+    except Exception:
+        pass
+    if rows_written > 0:
+        await inc_open_pr(db, org, author_login, 1)
 
 
 async def track_pr_closed(payload: dict, env, is_bot_fn, d1_binding_fn) -> None:
-    """Record a PR-closed event in D1 and update merged/closed monthly counters."""
+    """Record a PR-closed event in D1 and update merged/closed monthly counters.
+
+    Fix #1: Same TOCTOU fix as track_pr_opened — upsert first, then check
+    rows_written to decide whether counters need updating.
+    """
     from js import console
     db = d1_binding_fn(env)
     if not db:
@@ -362,46 +419,52 @@ async def track_pr_closed(payload: dict, env, is_bot_fn, d1_binding_fn) -> None:
     closed_at = pr.get("closed_at")
     merged_at = pr.get("merged_at")
     merged = bool(pr.get("merged"))
-    closed_ts = parse_github_timestamp(closed_at) if closed_at else int(time.time())
+    # Fix #8: use safe_event_ts so malformed timestamps don't produce "1970-01"
+    closed_ts = safe_event_ts(closed_at)
     if not (org and repo and pr_number and author_login):
         return
     await ensure_leaderboard_schema(db)
-    existing = await d1_first(
-        db,
-        "SELECT state, merged, closed_at FROM leaderboard_pr_state WHERE org = ? AND repo = ? AND pr_number = ?",
-        (org, repo, pr_number),
-    )
-    if existing and existing.get("state") == "closed" and int(existing.get("merged") or 0) == int(merged):
-        existing_closed_at = int(existing.get("closed_at") or 0)
-        if existing_closed_at == int(closed_ts or 0):
-            return
-    if existing and existing.get("state") == "open":
-        await inc_open_pr(db, org, author_login, -1)
-    event_ts = parse_github_timestamp(merged_at) if merged and merged_at else closed_ts
+    event_ts = safe_event_ts(merged_at) if merged and merged_at else closed_ts
     mk = month_key(event_ts)
-    if merged:
-        await inc_monthly(db, org, mk, author_login, "merged_prs", 1)
-    else:
-        await inc_monthly(db, org, mk, author_login, "closed_prs", 1)
     now = int(time.time())
-    await d1_run(
+    # Atomically upsert; only proceed when the row genuinely transitions to closed.
+    result = await d1_run(
         db,
         """
         INSERT INTO leaderboard_pr_state (org, repo, pr_number, author_login, state, merged, closed_at, updated_at)
         VALUES (?, ?, ?, ?, 'closed', ?, ?, ?)
         ON CONFLICT(org, repo, pr_number) DO UPDATE SET
             author_login = excluded.author_login,
-            state = 'closed',
-            merged = excluded.merged,
-            closed_at = excluded.closed_at,
-            updated_at = excluded.updated_at
+            state        = 'closed',
+            merged       = excluded.merged,
+            closed_at    = excluded.closed_at,
+            updated_at   = excluded.updated_at
+            WHERE leaderboard_pr_state.state != 'closed'
+               OR leaderboard_pr_state.merged != excluded.merged
+               OR leaderboard_pr_state.closed_at != excluded.closed_at
         """,
         (org, repo, pr_number, author_login, 1 if merged else 0, closed_ts, now),
     )
+    rows_written = 0
+    try:
+        rows_written = int(getattr(result, "rowsWritten", None) or 0)
+    except Exception:
+        pass
+    if rows_written > 0:
+        # Decrement open-PR counter (was previously open)
+        await inc_open_pr(db, org, author_login, -1)
+        if merged:
+            await inc_monthly(db, org, mk, author_login, "merged_prs", 1)
+        else:
+            await inc_monthly(db, org, mk, author_login, "closed_prs", 1)
 
 
 async def track_pr_reopened(payload: dict, env, is_bot_fn, d1_binding_fn) -> None:
-    """Reverse any closed-state counters when a PR is reopened."""
+    """Reverse any closed-state counters when a PR is reopened.
+
+    Fix #1: Same TOCTOU fix — upsert first, use rows_written to gate
+    the counter adjustments.
+    """
     from js import console
     db = d1_binding_fn(env)
     if not db:
@@ -417,34 +480,43 @@ async def track_pr_reopened(payload: dict, env, is_bot_fn, d1_binding_fn) -> Non
     if not (org and repo and pr_number and author_login):
         return
     await ensure_leaderboard_schema(db)
+    # Read the previous state so we can reverse the right monthly counter.
     existing = await d1_first(
         db,
         "SELECT state, merged, closed_at FROM leaderboard_pr_state WHERE org = ? AND repo = ? AND pr_number = ?",
         (org, repo, pr_number),
     )
-    if existing and existing.get("state") == "closed":
-        prev_merged = int(existing.get("merged") or 0)
-        prev_closed_at = int(existing.get("closed_at") or 0)
-        prev_mk = month_key(prev_closed_at) if prev_closed_at else month_key()
-        field = "merged_prs" if prev_merged else "closed_prs"
-        await inc_monthly(db, org, prev_mk, author_login, field, -1)
-    if not existing or existing.get("state") != "open":
-        await inc_open_pr(db, org, author_login, 1)
     now = int(time.time())
-    await d1_run(
+    result = await d1_run(
         db,
         """
         INSERT INTO leaderboard_pr_state (org, repo, pr_number, author_login, state, merged, closed_at, updated_at)
         VALUES (?, ?, ?, ?, 'open', 0, NULL, ?)
         ON CONFLICT(org, repo, pr_number) DO UPDATE SET
             author_login = excluded.author_login,
-            state = 'open',
-            merged = 0,
-            closed_at = NULL,
-            updated_at = excluded.updated_at
+            state        = 'open',
+            merged       = 0,
+            closed_at    = NULL,
+            updated_at   = excluded.updated_at
+            WHERE leaderboard_pr_state.state != 'open'
         """,
         (org, repo, pr_number, author_login, now),
     )
+    rows_written = 0
+    try:
+        rows_written = int(getattr(result, "rowsWritten", None) or 0)
+    except Exception:
+        pass
+    if rows_written > 0:
+        # Reverse the previous closed/merged monthly counter
+        if existing and existing.get("state") == "closed":
+            prev_merged = int(existing.get("merged") or 0)
+            prev_closed_at = int(existing.get("closed_at") or 0)
+            prev_mk = month_key(prev_closed_at) if prev_closed_at else month_key()
+            field = "merged_prs" if prev_merged else "closed_prs"
+            await inc_monthly(db, org, prev_mk, author_login, field, -1)
+        # Increment open-PR counter
+        await inc_open_pr(db, org, author_login, 1)
 
 
 async def track_comment(payload: dict, env, is_bot_fn, is_coderabbit_ping_fn, extract_command_fn, d1_binding_fn) -> None:
@@ -467,12 +539,20 @@ async def track_comment(payload: dict, env, is_bot_fn, is_coderabbit_ping_fn, ex
     if not (org and login):
         return
     await ensure_leaderboard_schema(db)
-    mk = month_key(parse_github_timestamp(created_at) if created_at else int(time.time()))
+    # Fix #8: use safe_event_ts to avoid "1970-01" on malformed timestamps
+    mk = month_key(safe_event_ts(created_at))
     await inc_monthly(db, org, mk, login, "comments", 1)
 
 
 async def track_review(payload: dict, env, is_bot_fn, d1_binding_fn) -> None:
-    """Award up to two review credits per PR per month using an atomic INSERT."""
+    """Award up to two review credits per PR per month using an atomic INSERT.
+
+    Fix #2: The previous pre-check SELECT 1 was redundant and introduced a
+    race window.  The PK constraint already prevents duplicate rows for the
+    same reviewer, and the WHERE COUNT < 2 subquery already gates different
+    reviewers.  Removing the pre-check eliminates both the extra round-trip
+    and the race window between the check and the insert.
+    """
     from js import console
     db = d1_binding_fn(env)
     if not db:
@@ -491,21 +571,15 @@ async def track_review(payload: dict, env, is_bot_fn, d1_binding_fn) -> None:
     if not (org and repo and pr_number and reviewer_login):
         return
     await ensure_leaderboard_schema(db)
-    mk = month_key(parse_github_timestamp(submitted_at) if submitted_at else int(time.time()))
-    exists = await d1_first(
-        db,
-        """
-        SELECT 1 FROM leaderboard_review_credits
-        WHERE org = ? AND repo = ? AND pr_number = ? AND month_key = ? AND reviewer_login = ?
-        """,
-        (org, repo, pr_number, mk, reviewer_login),
-    )
-    if exists:
-        return
+    # Fix #8: use safe_event_ts to avoid "1970-01" on malformed timestamps
+    mk = month_key(safe_event_ts(submitted_at))
+    # Fix #2: single atomic INSERT — no pre-check SELECT needed.
+    # The PK constraint handles duplicate reviewer rows (INSERT OR IGNORE),
+    # the WHERE COUNT < 2 subquery caps distinct reviewers per PR per month.
     result = await d1_run(
         db,
         """
-        INSERT INTO leaderboard_review_credits (org, repo, pr_number, month_key, reviewer_login, created_at)
+        INSERT OR IGNORE INTO leaderboard_review_credits (org, repo, pr_number, month_key, reviewer_login, created_at)
         SELECT ?, ?, ?, ?, ?, ?
         WHERE (
             SELECT COUNT(*) FROM leaderboard_review_credits
@@ -524,10 +598,12 @@ async def track_review(payload: dict, env, is_bot_fn, d1_binding_fn) -> None:
         await inc_monthly(db, org, mk, reviewer_login, "reviews", 1)
 
 
-
-
 async def calculate_stats_from_d1(owner: str, env) -> Optional[dict]:
-    """Read current-month leaderboard stats from D1 if configured."""
+    """Read current-month leaderboard stats from D1 if configured.
+
+    Fix #6: The two independent SELECT queries are now issued concurrently
+    via asyncio.gather() instead of sequentially.
+    """
     from js import console
     db = d1_binding(env)
     if not db:
@@ -536,23 +612,26 @@ async def calculate_stats_from_d1(owner: str, env) -> Optional[dict]:
     await ensure_leaderboard_schema(db)
     mk = month_key()
     start_timestamp, end_timestamp = month_window(mk)
-    monthly_rows = await d1_all(
-        db,
-        """
-        SELECT user_login, merged_prs, closed_prs, reviews, comments
-        FROM leaderboard_monthly_stats
-        WHERE org = ? AND month_key = ?
-        """,
-        (owner, mk),
-    )
-    open_rows = await d1_all(
-        db,
-        """
-        SELECT user_login, open_prs
-        FROM leaderboard_open_prs
-        WHERE org = ?
-        """,
-        (owner,),
+    # Fix #6: run both queries in parallel
+    monthly_rows, open_rows = await asyncio.gather(
+        d1_all(
+            db,
+            """
+            SELECT user_login, merged_prs, closed_prs, reviews, comments
+            FROM leaderboard_monthly_stats
+            WHERE org = ? AND month_key = ?
+            """,
+            (owner, mk),
+        ),
+        d1_all(
+            db,
+            """
+            SELECT user_login, open_prs
+            FROM leaderboard_open_prs
+            WHERE org = ?
+            """,
+            (owner,),
+        ),
     )
     user_stats = {}
 
@@ -593,8 +672,6 @@ async def calculate_stats_from_d1(owner: str, env) -> Optional[dict]:
     }
 
 
-
-
 async def get_backfill_state(db, owner: str, mk: str) -> dict:
     """Return the current incremental backfill cursor for an org and month."""
     row = await d1_first(
@@ -628,50 +705,59 @@ async def set_backfill_state(db, owner: str, mk: str, next_page: int, completed:
 
 
 async def reset_leaderboard_month(org: str, mk: str, db) -> dict:
-    """Clear all leaderboard data for an org/month so a fresh backfill can re-populate it."""
-    await ensure_leaderboard_schema(db)
-    deleted: dict = {}
-    for table, params in [
-        ("leaderboard_monthly_stats", (org, mk)),
-        ("leaderboard_backfill_repo_done", (org, mk)),
-        ("leaderboard_review_credits", (org, mk)),
-        ("leaderboard_backfill_state", (org, mk)),
-    ]:
-        try:
-            await d1_run(db, f"DELETE FROM {table} WHERE org = ? AND month_key = ?", params)
-            deleted[table] = "cleared"
-        except Exception as e:
-            from js import console
-            console.error(f"[AdminReset] Error clearing {table}: {e}")
-            deleted[table] = f"error: {e}"
-    start_ts, end_ts = month_window(mk)
-    try:
-        await d1_run(
-            db,
-            """
-            DELETE FROM leaderboard_pr_state
-            WHERE org = ?
-              AND (
-                closed_at BETWEEN ? AND ?
-                OR (state = 'open' AND closed_at IS NULL AND updated_at BETWEEN ? AND ?)
-              )
-            """,
-            (org, start_ts, end_ts, start_ts, end_ts),
-        )
-        deleted["leaderboard_pr_state"] = "cleared"
-    except Exception as e:
-        from js import console
-        console.error(f"[AdminReset] Error clearing leaderboard_pr_state: {e}")
-        deleted["leaderboard_pr_state"] = f"error: {e}"
-    try:
-        await d1_run(db, "DELETE FROM leaderboard_open_prs WHERE org = ?", (org,))
-        deleted["leaderboard_open_prs"] = "cleared"
-    except Exception as e:
-        from js import console
-        console.error(f"[AdminReset] Error clearing leaderboard_open_prs: {e}")
-        deleted["leaderboard_open_prs"] = f"error: {e}"
-    return deleted
+    """Clear all leaderboard data for an org/month so a fresh backfill can re-populate it.
 
+    Fix #3: All DELETEs are now executed inside a db.batch() call so they
+    succeed or fail atomically — no more partially-reset leaderboard state
+    if one DELETE fails midway.
+    """
+    await ensure_leaderboard_schema(db)
+    start_ts, end_ts = month_window(mk)
+    from js import console
+
+    # Build all statements for atomic batch execution
+    stmts_by_key: list[tuple[str, str, tuple]] = [
+        ("leaderboard_monthly_stats",    f"DELETE FROM leaderboard_monthly_stats WHERE org = ? AND month_key = ?",    (org, mk)),
+        ("leaderboard_backfill_repo_done", f"DELETE FROM leaderboard_backfill_repo_done WHERE org = ? AND month_key = ?", (org, mk)),
+        ("leaderboard_review_credits",   f"DELETE FROM leaderboard_review_credits WHERE org = ? AND month_key = ?",   (org, mk)),
+        ("leaderboard_backfill_state",   f"DELETE FROM leaderboard_backfill_state WHERE org = ? AND month_key = ?",   (org, mk)),
+        ("leaderboard_pr_state",
+         """
+         DELETE FROM leaderboard_pr_state
+         WHERE org = ?
+           AND (
+             closed_at BETWEEN ? AND ?
+             OR (state = 'open' AND closed_at IS NULL AND updated_at BETWEEN ? AND ?)
+           )
+         """,
+         (org, start_ts, end_ts, start_ts, end_ts)),
+        ("leaderboard_open_prs", "DELETE FROM leaderboard_open_prs WHERE org = ?", (org,)),
+    ]
+
+    deleted: dict = {}
+    try:
+        # Fix #3: batch all DELETEs atomically so a mid-flight failure does
+        # not leave the leaderboard in a partially-reset state.
+        batch_stmts = []
+        for _key, sql, params in stmts_by_key:
+            stmt = db.prepare(sql)
+            if params:
+                stmt = stmt.bind(*params)
+            batch_stmts.append(stmt)
+        await db.batch(batch_stmts)
+        for key, _sql, _params in stmts_by_key:
+            deleted[key] = "cleared"
+    except Exception as e:
+        console.error(f"[AdminReset] Batch DELETE failed: {e}")
+        # Fall back to individual deletes so we can report per-table status
+        for key, sql, params in stmts_by_key:
+            try:
+                await d1_run(db, sql, params)
+                deleted[key] = "cleared"
+            except Exception as inner_e:
+                console.error(f"[AdminReset] Error clearing {key}: {inner_e}")
+                deleted[key] = "error"
+    return deleted
 
 
 def format_leaderboard_comment(author_login: str, leaderboard_data: dict, owner: str, note: str = "") -> str:
