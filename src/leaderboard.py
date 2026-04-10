@@ -298,6 +298,8 @@ async def inc_open_pr(db, org: str, user_login: str, delta: int) -> None:
         console.log(f"[D1] Updated open PR count org={org} user={user_login} delta={delta}")
     except Exception as e:
         console.error(f"[D1] Failed to update open PRs org={org} user={user_login}: {e}")
+        raise
+        raise
 
 
 async def inc_monthly(db, org: str, mk: str, user_login: str, field: str, delta: int = 1) -> None:
@@ -339,6 +341,8 @@ async def inc_monthly(db, org: str, mk: str, user_login: str, field: str, delta:
         console.log(f"[D1] Updated {field} org={org} month={mk} user={user_login} +{delta}")
     except Exception as e:
         console.error(f"[D1] Failed to update {field} org={org} month={mk} user={user_login}: {e}")
+        raise
+        raise
 
 
 async def track_pr_opened(payload: dict, env, is_bot_fn, d1_binding_fn) -> None:
@@ -702,6 +706,8 @@ async def set_backfill_state(db, owner: str, mk: str, next_page: int, completed:
         )
     except Exception as e:
         console.error(f"[Backfill] Failed to update state: {e}")
+        raise
+        raise
 
 
 async def reset_leaderboard_month(org: str, mk: str, db) -> dict:
@@ -731,7 +737,8 @@ async def reset_leaderboard_month(org: str, mk: str, db) -> dict:
            )
          """,
          (org, start_ts, end_ts, start_ts, end_ts)),
-        ("leaderboard_open_prs", "DELETE FROM leaderboard_open_prs WHERE org = ?", (org,)),
+        # leaderboard_open_prs is intentionally excluded — it holds current-state
+        # data with no month_key and must not be wiped by a month-scoped reset.
     ]
 
     deleted: dict = {}
@@ -749,14 +756,10 @@ async def reset_leaderboard_month(org: str, mk: str, db) -> dict:
             deleted[key] = "cleared"
     except Exception as e:
         console.error(f"[AdminReset] Batch DELETE failed: {e}")
-        # Fall back to individual deletes so we can report per-table status
-        for key, sql, params in stmts_by_key:
-            try:
-                await d1_run(db, sql, params)
-                deleted[key] = "cleared"
-            except Exception as inner_e:
-                console.error(f"[AdminReset] Error clearing {key}: {inner_e}")
-                deleted[key] = "error"
+        # Do not fall back to individual deletes — that reintroduces partial resets.
+        for key, _sql, _params in stmts_by_key:
+            deleted[key] = "error"
+        return deleted
     return deleted
 
 
